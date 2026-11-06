@@ -68,7 +68,7 @@ export async function POST(request: Request) {
     audio: {
       input: {
         transcription: {
-          model: "gpt-4o-transcribe",
+          model: "gpt-live-transcribe",
           language: "en",
           prompt:
             "A personal English conversation with a Thai speaker. Preserve the speaker's actual wording, including grammar mistakes. Use conversation context to resolve names and repeated topics.",

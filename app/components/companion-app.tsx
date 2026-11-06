@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  ArrowDown,
   Archive,
   BookOpen,
   Check,
@@ -182,6 +183,7 @@ export function CompanionApp() {
   const [error, setError] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [newMemory, setNewMemory] = useState("");
+  const [isTranscriptPinned, setIsTranscriptPinned] = useState(true);
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
@@ -190,6 +192,8 @@ export function CompanionApp() {
   const startedAtRef = useRef<string | null>(null);
   const transcriptRef = useRef<TranscriptLine[]>([]);
   const assistantDraftRef = useRef<{ id: string; text: string } | null>(null);
+  const inputDraftsRef = useRef<Map<string, string>>(new Map());
+  const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -220,6 +224,15 @@ export function CompanionApp() {
   useEffect(() => {
     transcriptRef.current = transcript;
   }, [transcript]);
+
+  useEffect(() => {
+    const scroller = transcriptScrollRef.current;
+    if (!scroller || !isTranscriptPinned) return;
+    const frame = window.requestAnimationFrame(() => {
+      scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [transcript, isTranscriptPinned]);
 
   useEffect(() => {
     if (voiceState === "idle" || voiceState === "summarizing") return;
@@ -276,6 +289,23 @@ export function CompanionApp() {
     [updateTranscript],
   );
 
+  const appendInputDelta = useCallback(
+    (delta: string, eventId?: string) => {
+      if (!delta) return;
+      const id = eventId || "current-input";
+      const text = (inputDraftsRef.current.get(id) ?? "") + delta;
+      inputDraftsRef.current.set(id, text);
+      const exists = transcriptRef.current.some((line) => line.id === id);
+      const next = exists
+        ? transcriptRef.current.map((line) =>
+            line.id === id ? { ...line, text, final: false } : line,
+          )
+        : [...transcriptRef.current, { id, role: "me" as const, text, final: false }];
+      updateTranscript(next);
+    },
+    [updateTranscript],
+  );
+
   const handleRealtimeEvent = useCallback(
     (event: RealtimeEvent) => {
       switch (event.type) {
@@ -285,10 +315,17 @@ export function CompanionApp() {
         case "input_audio_buffer.speech_stopped":
           setVoiceState("thinking");
           break;
-        case "conversation.item.input_audio_transcription.completed":
-        case "input_audio_transcription.completed":
-          addFinalLine("me", event.transcript ?? "", event.item_id);
+        case "conversation.item.input_audio_transcription.delta":
+        case "input_audio_transcription.delta":
+          setVoiceState("listening");
+          appendInputDelta(event.delta ?? "", event.item_id);
           break;
+        case "conversation.item.input_audio_transcription.completed":
+        case "input_audio_transcription.completed": {
+          addFinalLine("me", event.transcript ?? "", event.item_id);
+          if (event.item_id) inputDraftsRef.current.delete(event.item_id);
+          break;
+        }
         case "response.output_audio_transcript.delta":
         case "response.audio_transcript.delta":
           setVoiceState("speaking");
@@ -309,7 +346,7 @@ export function CompanionApp() {
           break;
       }
     },
-    [addFinalLine, appendAssistantDelta],
+    [addFinalLine, appendAssistantDelta, appendInputDelta],
   );
 
   const closeConnection = useCallback(() => {
@@ -328,6 +365,8 @@ export function CompanionApp() {
     setTranscript([]);
     transcriptRef.current = [];
     assistantDraftRef.current = null;
+    inputDraftsRef.current.clear();
+    setIsTranscriptPinned(true);
     setSeconds(0);
     setVoiceState("connecting");
 
@@ -576,13 +615,69 @@ export function CompanionApp() {
                 </p>
               </div>
 
-              {transcript.length > 0 && (
-                <div className="live-caption" aria-live="polite">
-                  <span>{transcript.at(-1)?.role === "me" ? "You" : "Mellow"}</span>
-                  <p>{transcript.at(-1)?.text}</p>
-                </div>
-              )}
             </section>
+
+            {(isLive || transcript.length > 0) && (
+              <section className="live-transcript" aria-label="Live conversation transcript">
+                <div className="transcript-toolbar">
+                  <div>
+                    <span className="live-indicator" aria-hidden="true" />
+                    <div>
+                      <h3>Live transcript</h3>
+                      <p>This is what Mellow hears — your original words are not grammar-corrected.</p>
+                    </div>
+                  </div>
+                  <span className="transcript-count">{transcript.length} {transcript.length === 1 ? "turn" : "turns"}</span>
+                </div>
+
+                <div
+                  className="transcript-scroll"
+                  ref={transcriptScrollRef}
+                  role="region"
+                  aria-label="Scrollable live transcript"
+                  onScroll={(event) => {
+                    const node = event.currentTarget;
+                    const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+                    setIsTranscriptPinned(distanceFromBottom < 36);
+                  }}
+                >
+                  {transcript.length === 0 ? (
+                    <div className="transcript-empty">
+                      <Mic size={18} />
+                      <p>Start speaking. Your words will appear here while you talk.</p>
+                    </div>
+                  ) : (
+                    transcript.map((line) => (
+                      <article
+                        key={line.id}
+                        className={`transcript-line ${line.role === "me" ? "is-me" : "is-mellow"} ${line.final ? "" : "is-draft"}`}
+                      >
+                        <span>{line.role === "me" ? "You" : "Mellow"}</span>
+                        <p>
+                          {line.text}
+                          {!line.final && <i className="typing-cursor" aria-label="Transcribing live" />}
+                        </p>
+                      </article>
+                    ))
+                  )}
+                </div>
+
+                {!isTranscriptPinned && (
+                  <button
+                    className="jump-latest"
+                    onClick={() => {
+                      setIsTranscriptPinned(true);
+                      transcriptScrollRef.current?.scrollTo({
+                        top: transcriptScrollRef.current.scrollHeight,
+                        behavior: "smooth",
+                      });
+                    }}
+                  >
+                    <ArrowDown size={14} /> Latest sentence
+                  </button>
+                )}
+              </section>
+            )}
 
             {error && (
               <div className="notice error-notice">
