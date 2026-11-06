@@ -7,6 +7,7 @@ import {
   Check,
   ChevronRight,
   Clock3,
+  Cloud,
   Download,
   Headphones,
   Heart,
@@ -15,6 +16,7 @@ import {
   Mic,
   MicOff,
   Plus,
+  RefreshCw,
   Settings,
   Sparkles,
   Trash2,
@@ -26,6 +28,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Tab = "today" | "history" | "memory" | "settings";
 type VoiceState = "idle" | "connecting" | "listening" | "thinking" | "speaking" | "summarizing";
+type SyncStatus = "connecting" | "syncing" | "synced" | "offline" | "local";
 
 type Profile = {
   name: string;
@@ -98,6 +101,50 @@ const EMPTY_STATE: StoredState = {
   memories: [],
   sessions: [],
 };
+
+function normalizeStoredState(value: unknown): StoredState {
+  const candidate = value && typeof value === "object" ? (value as Partial<StoredState>) : {};
+  return {
+    profile: { ...DEFAULT_PROFILE, ...(candidate.profile ?? {}) },
+    memories: Array.isArray(candidate.memories) ? candidate.memories : [],
+    sessions: Array.isArray(candidate.sessions) ? candidate.sessions : [],
+  };
+}
+
+function hasPersonalProfile(profile: Profile) {
+  return Boolean(profile.name.trim() || profile.job.trim() || profile.interests.trim());
+}
+
+function mergeStoredStates(
+  local: StoredState,
+  cloud: StoredState,
+  preferLocalProfile = false,
+): StoredState {
+  const sessions = new Map<string, PracticeSession>();
+  for (const session of [...cloud.sessions, ...local.sessions]) {
+    const current = sessions.get(session.id);
+    if (!current || (!current.summary && session.summary)) sessions.set(session.id, session);
+  }
+
+  const memories = new Map<string, MemoryNote>();
+  for (const memory of [...cloud.memories, ...local.memories]) {
+    memories.set(memory.id, memory);
+  }
+
+  const useLocalProfile =
+    preferLocalProfile ||
+    (hasPersonalProfile(local.profile) && !hasPersonalProfile(cloud.profile));
+
+  return {
+    profile: useLocalProfile ? local.profile : cloud.profile,
+    sessions: [...sessions.values()].sort(
+      (a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt),
+    ),
+    memories: [...memories.values()].sort(
+      (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt),
+    ),
+  };
+}
 
 function formatDuration(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -184,6 +231,7 @@ export function CompanionApp() {
   const [showSetup, setShowSetup] = useState(false);
   const [newMemory, setNewMemory] = useState("");
   const [isTranscriptPinned, setIsTranscriptPinned] = useState(true);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>("connecting");
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
@@ -194,32 +242,165 @@ export function CompanionApp() {
   const assistantDraftRef = useRef<{ id: string; text: string } | null>(null);
   const inputDraftsRef = useRef<Map<string, string>>(new Map());
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const dataRef = useRef<StoredState>(EMPTY_STATE);
+  const cloudRevisionRef = useRef(0);
+  const syncReadyRef = useRef(false);
+  const lastSyncedJsonRef = useRef("");
+
+  const pushCloudState = useCallback(async (state: StoredState) => {
+    setSyncStatus("syncing");
+    try {
+      const response = await fetch("/api/sync", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          data: state,
+          baseRevision: cloudRevisionRef.current,
+        }),
+      });
+
+      if (response.status === 401) {
+        setSyncStatus("local");
+        return false;
+      }
+
+      if (response.status === 409) {
+        const conflict = (await response.json()) as {
+          data?: unknown;
+          revision?: number;
+        };
+        const cloud = normalizeStoredState(conflict.data);
+        cloudRevisionRef.current = conflict.revision ?? 0;
+        lastSyncedJsonRef.current = JSON.stringify(cloud);
+        const merged = mergeStoredStates(dataRef.current, cloud, true);
+        dataRef.current = merged;
+        setData(merged);
+        setSyncStatus("syncing");
+        return false;
+      }
+
+      if (!response.ok) throw new Error("sync_failed");
+      const result = (await response.json()) as { revision?: number };
+      cloudRevisionRef.current = result.revision ?? cloudRevisionRef.current + 1;
+      lastSyncedJsonRef.current = JSON.stringify(state);
+      setSyncStatus("synced");
+      return true;
+    } catch {
+      setSyncStatus("offline");
+      return false;
+    }
+  }, []);
+
+  const pullCloudState = useCallback(async () => {
+    setSyncStatus("syncing");
+    try {
+      const response = await fetch("/api/sync", { cache: "no-store" });
+      if (response.status === 401) {
+        setSyncStatus("local");
+        return;
+      }
+      if (!response.ok) throw new Error("sync_failed");
+      const result = (await response.json()) as {
+        data?: unknown;
+        revision?: number;
+      };
+      const cloud = result.data ? normalizeStoredState(result.data) : null;
+      cloudRevisionRef.current = result.revision ?? 0;
+
+      if (!cloud) {
+        lastSyncedJsonRef.current = JSON.stringify(EMPTY_STATE);
+        if (JSON.stringify(dataRef.current) !== lastSyncedJsonRef.current) {
+          await pushCloudState(dataRef.current);
+        } else {
+          setSyncStatus("synced");
+        }
+        return;
+      }
+
+      lastSyncedJsonRef.current = JSON.stringify(cloud);
+      const merged = mergeStoredStates(dataRef.current, cloud);
+      dataRef.current = merged;
+      setData(merged);
+      if (JSON.stringify(merged) !== lastSyncedJsonRef.current) {
+        await pushCloudState(merged);
+      } else {
+        setSyncStatus("synced");
+      }
+    } catch {
+      setSyncStatus("offline");
+    }
+  }, [pushCloudState]);
 
   useEffect(() => {
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      try {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-          const parsed = JSON.parse(saved) as Partial<StoredState>;
-          setData({
-            profile: { ...DEFAULT_PROFILE, ...(parsed.profile ?? {}) },
-            memories: Array.isArray(parsed.memories) ? parsed.memories : [],
-            sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-          });
+      void (async () => {
+        let local = EMPTY_STATE;
+        try {
+          const saved = localStorage.getItem(STORAGE_KEY);
+          if (saved) local = normalizeStoredState(JSON.parse(saved));
+        } catch {
+          setError("I couldn't read the saved memory on this device.");
         }
-      } catch {
-        setError("I couldn't read the saved memory on this device.");
-      } finally {
-        setHydrated(true);
-      }
+
+        if (cancelled) return;
+        dataRef.current = local;
+        setData(local);
+
+        try {
+          const response = await fetch("/api/sync", { cache: "no-store" });
+          if (cancelled) return;
+          if (response.status === 401) {
+            setSyncStatus("local");
+          } else if (response.ok) {
+            const result = (await response.json()) as {
+              data?: unknown;
+              revision?: number;
+            };
+            cloudRevisionRef.current = result.revision ?? 0;
+            if (result.data) {
+              const cloud = normalizeStoredState(result.data);
+              lastSyncedJsonRef.current = JSON.stringify(cloud);
+              const merged = mergeStoredStates(local, cloud);
+              dataRef.current = merged;
+              setData(merged);
+            } else {
+              lastSyncedJsonRef.current = JSON.stringify(EMPTY_STATE);
+            }
+            setSyncStatus("synced");
+          } else {
+            setSyncStatus("offline");
+          }
+        } catch {
+          setSyncStatus("offline");
+        } finally {
+          if (!cancelled) {
+            syncReadyRef.current = true;
+            setHydrated(true);
+          }
+        }
+      })();
     }, 0);
-    return () => window.clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
+    dataRef.current = data;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data, hydrated]);
+    if (!syncReadyRef.current) return;
+
+    const serialized = JSON.stringify(data);
+    if (serialized === lastSyncedJsonRef.current) return;
+    setSyncStatus("syncing");
+    const timer = window.setTimeout(() => {
+      void pushCloudState(data);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [data, hydrated, pushCloudState]);
 
   useEffect(() => {
     transcriptRef.current = transcript;
@@ -537,15 +718,36 @@ export function CompanionApp() {
     URL.revokeObjectURL(url);
   };
 
-  const clearAll = () => {
-    if (!window.confirm("Delete all memories and conversation history from this device?")) return;
-    setData(EMPTY_STATE);
-    setSelectedSession(null);
-    localStorage.removeItem(STORAGE_KEY);
+  const clearAll = async () => {
+    if (!window.confirm("Delete all memories, conversations, and cloud data from every device?")) return;
+    setSyncStatus("syncing");
+    try {
+      const response = await fetch("/api/sync", { method: "DELETE" });
+      if (!response.ok && response.status !== 401) throw new Error("delete_failed");
+      syncReadyRef.current = false;
+      cloudRevisionRef.current = 0;
+      lastSyncedJsonRef.current = JSON.stringify(EMPTY_STATE);
+      dataRef.current = EMPTY_STATE;
+      setData(EMPTY_STATE);
+      setSelectedSession(null);
+      localStorage.removeItem(STORAGE_KEY);
+      syncReadyRef.current = true;
+      setSyncStatus(response.status === 401 ? "local" : "synced");
+    } catch {
+      setSyncStatus("offline");
+      setError("I couldn't delete the cloud copy. Nothing was removed—try again when you're online.");
+    }
   };
 
   const isLive = voiceState !== "idle" && voiceState !== "summarizing";
   const latestSession = data.sessions[0];
+  const syncLabel = {
+    connecting: "Connecting private sync…",
+    syncing: "Syncing…",
+    synced: "Synced to your account",
+    offline: "Offline — saved on this device",
+    local: "Saved on this device",
+  }[syncStatus];
 
   return (
     <main className="app-shell">
@@ -561,7 +763,7 @@ export function CompanionApp() {
         </nav>
         <div className="rail-bottom">
           <NavButton active={tab === "settings"} icon={<Settings size={19} />} label="Settings" onClick={() => setTab("settings")} />
-          <div className="private-chip"><span /> Private to this device</div>
+          <div className={`private-chip sync-${syncStatus}`}><span /> {syncLabel}</div>
         </div>
       </aside>
 
@@ -762,7 +964,7 @@ export function CompanionApp() {
           <div className="inner-page settings-page page-enter">
             <header className="section-header"><div><p className="eyebrow">MAKE IT YOURS</p><h1>How Mellow should know you.</h1></div></header>
             <section className="settings-card">
-              <div className="settings-title"><div className="card-icon lavender"><UserRound size={19} /></div><div><h2>About me</h2><p>This stays in this browser and is sent only when a conversation begins.</p></div></div>
+              <div className="settings-title"><div className="card-icon lavender"><UserRound size={19} /></div><div><h2>About me</h2><p>Saved privately to your Mellow account and available on your devices.</p></div></div>
               <div className="form-grid">
                 <label><span>What should Mellow call you?</span><input value={data.profile.name} onChange={(event) => setData((current) => ({ ...current, profile: { ...current.profile, name: event.target.value } }))} placeholder="Your name" /></label>
                 <label><span>What do you do?</span><input value={data.profile.job} onChange={(event) => setData((current) => ({ ...current, profile: { ...current.profile, job: event.target.value } }))} placeholder="Your work or current focus" /></label>
@@ -785,9 +987,18 @@ export function CompanionApp() {
                 ))}
               </div>
             </section>
+            <section className="settings-card sync-card">
+              <div className="settings-title"><div className="card-icon mint"><Cloud size={19} /></div><div><h2>Private cloud sync</h2><p>Memory, History, profile, and learning recaps stay together on mobile and computer.</p></div></div>
+              <div className="sync-row">
+                <div className={`sync-state sync-${syncStatus}`}><span /> <strong>{syncLabel}</strong></div>
+                <button onClick={() => void pullCloudState()} disabled={syncStatus === "syncing" || syncStatus === "connecting"}>
+                  <RefreshCw size={16} /> Sync now
+                </button>
+              </div>
+            </section>
             <section className="settings-card data-card">
-              <div className="settings-title"><div className="card-icon peach"><Archive size={19} /></div><div><h2>Your data</h2><p>Back up everything or start fresh. Nothing is shared with another account.</p></div></div>
-              <div className="data-actions"><button onClick={exportData}><Download size={17} /> Export backup</button><button className="danger" onClick={clearAll}><Trash2 size={17} /> Delete everything</button></div>
+              <div className="settings-title"><div className="card-icon peach"><Archive size={19} /></div><div><h2>Your data</h2><p>Back up everything or remove it from the cloud and every synced device.</p></div></div>
+              <div className="data-actions"><button onClick={exportData}><Download size={17} /> Export backup</button><button className="danger" onClick={() => void clearAll()}><Trash2 size={17} /> Delete everywhere</button></div>
             </section>
           </div>
         )}

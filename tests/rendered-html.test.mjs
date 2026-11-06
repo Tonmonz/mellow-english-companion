@@ -52,3 +52,21 @@ test("streams input transcription into a scrollable conversation log", async () 
   assert.match(css, /overflow-y:\s*auto/);
   assert.match(css, /\.transcript-line\.is-me/);
 });
+
+test("syncs personal data through the private account database", async () => {
+  const [component, syncRoute, schema, hosting] = await Promise.all([
+    readFile(new URL("../app/components/companion-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/sync/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../db/schema.ts", import.meta.url), "utf8"),
+    readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(hosting, /"d1":\s*"DB"/);
+  assert.match(schema, /mellow_states/);
+  assert.match(syncRoute, /getChatGPTUser/);
+  assert.match(syncRoute, /export async function GET/);
+  assert.match(syncRoute, /export async function PUT/);
+  assert.match(syncRoute, /export async function DELETE/);
+  assert.match(component, /Private cloud sync/);
+  assert.match(component, /mergeStoredStates/);
+});
