@@ -9,19 +9,24 @@ import {
   Clock3,
   Cloud,
   Download,
+  ExternalLink,
+  Gauge,
   Headphones,
   Heart,
   History,
   Home,
   Mic,
   MicOff,
+  Moon,
   Plus,
   RefreshCw,
   Settings,
   Sparkles,
+  Sun,
   Trash2,
   UserRound,
   Volume2,
+  WalletCards,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -29,6 +34,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 type Tab = "today" | "history" | "memory" | "settings";
 type VoiceState = "idle" | "connecting" | "listening" | "thinking" | "speaking" | "summarizing";
 type SyncStatus = "connecting" | "syncing" | "synced" | "offline" | "local";
+type Theme = "light" | "dark";
+type VoiceModel = "gpt-realtime-2.1-mini" | "gpt-realtime-2.1";
+type RealtimeVoice = "alloy" | "ash" | "ballad" | "coral" | "echo" | "sage" | "shimmer" | "verse" | "marin" | "cedar";
 
 type Profile = {
   name: string;
@@ -86,6 +94,20 @@ type RealtimeEvent = {
 };
 
 const STORAGE_KEY = "mellow-personal-v1";
+const PREFERENCES_KEY = "mellow-preferences-v1";
+const BILLING_URL = "https://platform.openai.com/settings/organization/billing/overview";
+const VOICE_OPTIONS: Array<{ value: RealtimeVoice; label: string }> = [
+  { value: "marin", label: "Marin · recommended" },
+  { value: "cedar", label: "Cedar · recommended" },
+  { value: "alloy", label: "Alloy" },
+  { value: "ash", label: "Ash" },
+  { value: "ballad", label: "Ballad" },
+  { value: "coral", label: "Coral" },
+  { value: "echo", label: "Echo" },
+  { value: "sage", label: "Sage" },
+  { value: "shimmer", label: "Shimmer" },
+  { value: "verse", label: "Verse" },
+];
 
 const DEFAULT_PROFILE: Profile = {
   name: "",
@@ -232,6 +254,10 @@ export function CompanionApp() {
   const [newMemory, setNewMemory] = useState("");
   const [isTranscriptPinned, setIsTranscriptPinned] = useState(true);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>("connecting");
+  const [theme, setTheme] = useState<Theme>("light");
+  const [voiceModel, setVoiceModel] = useState<VoiceModel>("gpt-realtime-2.1-mini");
+  const [voice, setVoice] = useState<RealtimeVoice>("marin");
+  const [preferencesHydrated, setPreferencesHydrated] = useState(false);
 
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RTCDataChannel | null>(null);
@@ -246,6 +272,41 @@ export function CompanionApp() {
   const cloudRevisionRef = useRef(0);
   const syncReadyRef = useRef(false);
   const lastSyncedJsonRef = useRef("");
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = JSON.parse(localStorage.getItem(PREFERENCES_KEY) || "{}") as {
+          theme?: Theme;
+          voiceModel?: VoiceModel;
+          voice?: RealtimeVoice;
+        };
+        const savedTheme = saved.theme === "dark" ? "dark" : "light";
+        const savedModel = saved.voiceModel === "gpt-realtime-2.1"
+          ? "gpt-realtime-2.1"
+          : "gpt-realtime-2.1-mini";
+        setTheme(savedTheme);
+        setVoiceModel(savedModel);
+        setVoice(VOICE_OPTIONS.some((option) => option.value === saved.voice) ? saved.voice! : "marin");
+        document.documentElement.dataset.theme = savedTheme;
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      } finally {
+        setPreferencesHydrated(true);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!preferencesHydrated) return;
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(PREFERENCES_KEY, JSON.stringify({ theme, voiceModel, voice }));
+  }, [preferencesHydrated, theme, voice, voiceModel]);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [tab]);
 
   const pushCloudState = useCallback(async (state: StoredState) => {
     setSyncStatus("syncing");
@@ -610,6 +671,8 @@ export function CompanionApp() {
         body: JSON.stringify({
           sdp: offer.sdp,
           context: buildContext(data),
+          model: voiceModel,
+          voice,
         }),
       });
 
@@ -629,7 +692,7 @@ export function CompanionApp() {
       setVoiceState("idle");
       setError(caught instanceof Error ? caught.message : "I couldn't start the conversation.");
     }
-  }, [closeConnection, data, handleRealtimeEvent]);
+  }, [closeConnection, data, handleRealtimeEvent, voice, voiceModel]);
 
   const summarizeSession = useCallback(
     async (session: PracticeSession) => {
@@ -775,7 +838,15 @@ export function CompanionApp() {
                 <p className="eyebrow">YOUR DAILY SAFE SPACE</p>
                 <h1>{data.profile.name ? `Good evening, ${data.profile.name}.` : "Good evening."}</h1>
               </div>
-              <div className="streak-pill"><Sparkles size={15} /> {streak} day streak</div>
+              <div className="topbar-actions">
+                <a className="credit-pill" href={BILLING_URL} target="_blank" rel="noreferrer" title="Open your live OpenAI credit balance">
+                  <WalletCards size={15} /> Credit <strong>Check balance</strong> <ExternalLink size={12} />
+                </a>
+                <button className="theme-toggle" onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")} aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}>
+                  {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+                </button>
+                <div className="streak-pill"><Sparkles size={15} /> {streak} day streak</div>
+              </div>
             </header>
 
             <section className={`voice-stage ${isLive ? "is-live" : ""}`}>
@@ -812,9 +883,18 @@ export function CompanionApp() {
                   </span>
                   {isLive ? <MicOff className="orb-icon" size={28} /> : <Mic className="orb-icon" size={28} />}
                 </button>
-                <p className="orb-label">
-                  {isLive ? `${formatDuration(seconds)} · tap to finish` : "Tap to start talking"}
-                </p>
+                <div className="orb-controls">
+                  <p className="orb-label">
+                    {isLive ? `${formatDuration(seconds)} · tap to finish` : "Tap to start talking"}
+                  </p>
+                  <label className="voice-picker">
+                    <Volume2 size={14} aria-hidden="true" />
+                    <span>Voice</span>
+                    <select value={voice} onChange={(event) => setVoice(event.target.value as RealtimeVoice)} disabled={isLive} aria-label="Choose Mellow's voice">
+                      {VOICE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </label>
+                </div>
               </div>
 
             </section>
@@ -985,6 +1065,35 @@ export function CompanionApp() {
                     <span className="radio">{data.profile.correctionStyle === value && <Check size={14} />}</span><strong>{title}</strong><small>{description}</small>
                   </button>
                 ))}
+              </div>
+            </section>
+            <section className="settings-card usage-card">
+              <div className="settings-title"><div className="card-icon mint"><Gauge size={19} /></div><div><h2>Credit & conversation model</h2><p>Choose how Mellow balances cost and conversation quality.</p></div></div>
+              <div className="billing-row">
+                <div>
+                  <span className="billing-label">OPENAI API CREDIT</span>
+                  <strong>Live balance is on OpenAI</strong>
+                  <p>OpenAI does not provide a supported balance endpoint for a normal project API key. Top up on the Billing page—your app will continue with the same key and does not need a new deploy.</p>
+                </div>
+                <a href={BILLING_URL} target="_blank" rel="noreferrer">View balance & top up <ExternalLink size={14} /></a>
+              </div>
+              <div className="choice-grid model-choice" role="radiogroup" aria-label="Conversation model">
+                {([
+                  ["gpt-realtime-2.1-mini", "Save credit", "Lower-cost realtime model for everyday English practice."],
+                  ["gpt-realtime-2.1", "Best conversation", "Higher-quality voice model when nuance matters most."],
+                ] as const).map(([value, title, description]) => (
+                  <button key={value} role="radio" aria-checked={voiceModel === value} className={voiceModel === value ? "selected" : ""} onClick={() => setVoiceModel(value)} disabled={isLive}>
+                    <span className="radio">{voiceModel === value && <Check size={14} />}</span><strong>{title}</strong><small>{description}</small><code>{value}</code>
+                  </button>
+                ))}
+              </div>
+              {isLive && <p className="setting-note">Finish the current conversation before changing models.</p>}
+            </section>
+            <section className="settings-card">
+              <div className="settings-title"><div className="card-icon lavender">{theme === "dark" ? <Moon size={19} /> : <Sun size={19} />}</div><div><h2>Appearance</h2><p>Keep Mellow comfortable in bright or low-light spaces.</p></div></div>
+              <div className="theme-control" role="group" aria-label="Color theme">
+                <button className={theme === "light" ? "selected" : ""} onClick={() => setTheme("light")}><Sun size={17} /> Light</button>
+                <button className={theme === "dark" ? "selected" : ""} onClick={() => setTheme("dark")}><Moon size={17} /> Dark</button>
               </div>
             </section>
             <section className="settings-card sync-card">

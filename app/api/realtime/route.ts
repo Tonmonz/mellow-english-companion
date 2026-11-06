@@ -4,7 +4,12 @@ const MAX_CONTEXT_LENGTH = 12_000;
 type SessionRequest = {
   sdp?: unknown;
   context?: unknown;
+  model?: unknown;
+  voice?: unknown;
 };
+
+const ALLOWED_MODELS = new Set(["gpt-realtime-2.1-mini", "gpt-realtime-2.1"]);
+const ALLOWED_VOICES = new Set(["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"]);
 
 function companionInstructions(context: string) {
   return `You are Mellow, my private English companion. You are warm, curious, calm, and emotionally attentive. Your job is to help me become comfortable speaking English through natural daily conversation.
@@ -59,10 +64,18 @@ export async function POST(request: Request) {
     typeof body.context === "string"
       ? body.context.slice(0, MAX_CONTEXT_LENGTH)
       : "";
+  const requestedModel = typeof body.model === "string" ? body.model : "";
+  const model = ALLOWED_MODELS.has(requestedModel)
+    ? requestedModel
+    : process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2.1-mini";
+  const requestedVoice = typeof body.voice === "string" ? body.voice : "";
+  const voice = ALLOWED_VOICES.has(requestedVoice)
+    ? requestedVoice
+    : process.env.OPENAI_VOICE || "marin";
 
   const session = {
     type: "realtime",
-    model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime-2.1",
+    model,
     output_modalities: ["audio"],
     instructions: companionInstructions(context),
     audio: {
@@ -80,7 +93,7 @@ export async function POST(request: Request) {
           interrupt_response: true,
         },
       },
-      output: { voice: process.env.OPENAI_VOICE || "marin" },
+      output: { voice },
     },
   };
 
@@ -104,7 +117,9 @@ export async function POST(request: Request) {
       return Response.json(
         {
           error: "realtime_connection_failed",
-          message: "OpenAI could not start the voice session.",
+          message: upstream.status === 429
+            ? "OpenAI could not start the session. Your API credit may be empty or a usage limit may have been reached—check Billing and try again."
+            : "OpenAI could not start the voice session.",
           status: upstream.status,
         },
         { status: upstream.status },
